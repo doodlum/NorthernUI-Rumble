@@ -18,11 +18,12 @@
 
 #include <windows.h>
 #include <xinput.h>
+#include <ScriptUtils.h>
 #pragma comment(lib, "xinput9_1_0.lib")
 
-IDebugLog		gLog("NorthernUIRumble.log");
+IDebugLog gLog("NorthernUIRumble.log");
 
-PluginHandle				g_pluginHandle = kPluginHandle_Invalid;
+PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 
 OBSEMessagingInterface* msgIntfc;
 OBSEEventManagerInterface* evntIntfc;
@@ -64,10 +65,18 @@ struct RumbleState {
 	float fRumbleStruckTime = 0;
 };
 
-RumbleState rumbleState;
-bool registeredForUpdate = false;
+auto fRumbleAttackStrength = 0.25;
+float fRumbleAttackTime = 0.25;
+
+struct RumbleCustomState {
+	float fRumbleAttackTime = 0;
+};
 
 DWORD gamepadIndex = -1;
+RumbleState rumbleState;
+RumbleCustomState rumbleCustomState;
+bool registeredForUpdate = false;
+bool playerValidAttack = false;
 
 void GetConnectedGamepad()
 {
@@ -117,6 +126,9 @@ void RumbleUpdate() {
 	rumble += fRumbleHitStrength * (rumbleState.fRumbleHitTime / fRumbleHitTime);
 	rumble += fRumbleBlockStrength * (rumbleState.fRumbleBlockTime / fRumbleBlockTime);
 	rumble += fRumbleStruckStrength * (rumbleState.fRumbleStruckTime / fRumbleStruckTime);
+
+	rumble += fRumbleAttackStrength * (rumbleCustomState.fRumbleAttackTime / fRumbleAttackTime);
+
 	rumble = min(rumble, 1.0f);
 	SetRumble(rumble);
 
@@ -127,9 +139,10 @@ void RumbleUpdate() {
 	rumbleState.fRumblePainTime = max(0, rumbleState.fRumblePainTime - delta);
 	rumbleState.fRumbleStruckTime = max(0, rumbleState.fRumbleStruckTime - delta);
 
+	rumbleCustomState.fRumbleAttackTime = max(0, rumbleCustomState.fRumbleAttackTime - delta);
+
 	if (!rumble)
 		registeredForUpdate = false;
-
 }
 
 enum class RumbleType {
@@ -139,6 +152,11 @@ enum class RumbleType {
 	Pain,
 	Struck
 };
+
+void ScheduleCustomSpellRumbleUpdate(float power) {
+	rumbleCustomState.fRumbleAttackTime = max(rumbleCustomState.fRumbleAttackTime, fRumbleAttackTime * power);
+	registeredForUpdate = true;
+}
 
 void ScheduleRumbleUpdate(RumbleType type) {
 	std::lock_guard<std::shared_mutex> lk(rumbleStateLock);
@@ -159,9 +177,7 @@ void ScheduleRumbleUpdate(RumbleType type) {
 		rumbleState.fRumbleStruckTime = fRumbleStruckTime;
 		break;
 	}
-	if (!registeredForUpdate) {
-		registeredForUpdate = true;
-	}
+	registeredForUpdate = true;
 }
 
 void RumbleAsync() {
@@ -176,6 +192,110 @@ void RumbleAsync() {
 	}
 }
 
+void OnFallImpact(void* arg0, void* arg1, TESObjectREFR* thisObj) {
+	TESObjectREFR* faller = (TESObjectREFR*)arg0;
+	if (faller == *g_thePlayer) {
+		_DMESSAGE("Rumble Pain");
+		ScheduleRumbleUpdate(RumbleType::Pain);
+	}
+}
+
+TESObjectWEAP* GetEquippedWeapon(Actor* a_actor) {
+	;
+	auto equippedItems = a_actor->GetEquippedItems();
+	for (auto item : equippedItems) {
+		if (auto weapon = (TESObjectWEAP*)Oblivion_DynamicCast(item, 0, RTTI_TESForm, RTTI_TESObjectWEAP, 0)) {
+			return weapon;
+		}
+	}
+}
+
+static MiddleHighProcess* ExtractMiddleHighProcess(TESObjectREFR* thisObj)
+{
+	MiddleHighProcess* proc = NULL;
+	MobileObject* mob = (MobileObject*)Oblivion_DynamicCast(thisObj, 0, RTTI_TESObjectREFR, RTTI_MobileObject, 0);
+	if (mob)
+		proc = (MiddleHighProcess*)Oblivion_DynamicCast(mob->process, 0, RTTI_BaseProcess, RTTI_MiddleHighProcess, 0);
+
+	return proc;
+}
+
+ActorAnimData* GetActorAnimData(TESObjectREFR* callingObj)
+{
+	if (callingObj == *g_thePlayer && (*g_thePlayer)->isThirdPerson == 0)
+		return (*g_thePlayer)->firstPersonAnimData;
+	else
+	{
+		MiddleHighProcess* proc = ExtractMiddleHighProcess(callingObj);
+		if (proc)
+			return proc->animData;
+	}
+
+	return NULL;
+}
+
+bool ActorAnimData::FindAnimInRange(UInt32 lowBound, UInt32 highBound)
+{
+	bool found = false;
+	if (highBound == -1)
+		highBound = lowBound;
+
+	for (UInt32 idx = 0; idx < 5; idx++)
+	{
+		BSAnimGroupSequence* anim = animSequences[idx];
+		found = (anim && anim->animGroup->animGroup >= lowBound && anim->animGroup->animGroup <= highBound);
+		if (found)
+			break;
+	}
+	return found;
+}
+
+static bool IsCasting(Actor* a_actor)
+{
+	ActorAnimData* animData = GetActorAnimData(a_actor);
+	if (animData)
+	{
+		if (animData->FindAnimInRange(TESAnimGroup::kAnimGroup_CastSelf, TESAnimGroup::kAnimGroup_CastTargetAlt))
+			return true;
+	}
+	return false;
+}
+
+void OnAttack(void* arg0, void* arg1, TESObjectREFR* thisObj) {
+	if (arg0 == *g_thePlayer) {
+		playerValidAttack = false;
+		if (auto actor = (Actor*)Oblivion_DynamicCast(arg0, 0, RTTI_TESObjectREFR, RTTI_Actor, 0)) {
+			if (auto weapon = GetEquippedWeapon(actor)) {
+				if (!IsCasting(actor) && weapon->type != TESObjectWEAP::kType_Staff) {
+					playerValidAttack = true;
+				}
+			}
+		}
+	}
+}
+
+void OnBowAttack(void* arg0, void* arg1, TESObjectREFR* thisObj) {
+	if (arg0 == *g_thePlayer) {
+		playerValidAttack = false;
+	}
+}
+
+void OnRelease(void* arg0, void* arg1, TESObjectREFR* thisObj) {
+	if (arg0 == *g_thePlayer) {
+		if (auto actor = (Actor*)Oblivion_DynamicCast(arg0, 0, RTTI_TESObjectREFR, RTTI_Actor, 0)) {
+			if (auto weapon = GetEquippedWeapon(actor)) {
+				if (weapon->type != TESObjectWEAP::kType_Staff && !IsCasting(actor)) {
+					ScheduleCustomSpellRumbleUpdate(1 / weapon->speed);
+					_DMESSAGE("Rumble Swing");
+					return;
+				}
+			}
+			ScheduleCustomSpellRumbleUpdate(1);
+			_DMESSAGE("Rumble Magic");
+		}
+	}
+}
+
 static HighProcess* ExtractHighProcess(TESObjectREFR* thisObj)
 {
 	HighProcess* hiProc = NULL;
@@ -186,26 +306,14 @@ static HighProcess* ExtractHighProcess(TESObjectREFR* thisObj)
 	return hiProc;
 }
 
-TESObjectWEAP* GetEquippedWeapon(Actor* a_actor) {;
-	auto equippedItems = a_actor->GetEquippedItems();
-	for (auto item : equippedItems) {
-		if (auto weapon = (TESObjectWEAP*)Oblivion_DynamicCast(item, 0, RTTI_TESForm, RTTI_TESObjectWEAP, 0)) {
-			return weapon;
-		}
-	}
-}
-
 void OnHit(void* source, void* object, TESObjectREFR* thisObj) {
 	TESObjectREFR* attacker = (TESObjectREFR*)object;
 	TESObjectREFR* target = (TESObjectREFR*)source;
 	if (attacker == *g_thePlayer) {
 		if (target) {
 			auto actor = (Actor*)Oblivion_DynamicCast(attacker, 0, RTTI_TESObjectREFR, RTTI_Actor, 0);
-			if (auto weapon = GetEquippedWeapon(actor)) {
-				if (weapon->type == TESObjectWEAP::kType_Staff || weapon->type == TESObjectWEAP::kType_Bow) { // ranged
-					return;
-				}
-			}
+			if (!playerValidAttack)
+				return;
 			HighProcess* hiProc = ExtractHighProcess(attacker);
 			if (hiProc && hiProc->IsBlocking()) {
 				_DMESSAGE("Rumble Block");
@@ -219,7 +327,7 @@ void OnHit(void* source, void* object, TESObjectREFR* thisObj) {
 	}
 	else if (target == *g_thePlayer) {
 		Actor* actor = (Actor*)Oblivion_DynamicCast(attacker, 0, RTTI_TESObjectREFR, RTTI_Actor, 0);
-		if (actor){
+		if (actor) {
 			HighProcess* hiProc = ExtractHighProcess(target);
 			if (hiProc && hiProc->IsBlocking()) {
 				_DMESSAGE("Rumble Block");
@@ -243,6 +351,10 @@ void MessageHandler(OBSEMessagingInterface::Message* msg)
 	case OBSEMessagingInterface::kMessage_PreLoadGame:
 		if (!init) {
 			GetConnectedGamepad();
+			evntIntfc->RegisterEvent("OnFallImpact", OnFallImpact, nullptr, nullptr, nullptr);
+			evntIntfc->RegisterEvent("OnAttack", OnAttack, nullptr, nullptr, nullptr);
+			evntIntfc->RegisterEvent("OnBowAttack", OnBowAttack, nullptr, nullptr, nullptr);
+			evntIntfc->RegisterEvent("OnRelease", OnRelease, nullptr, nullptr, nullptr);
 			evntIntfc->RegisterEvent("OnHit", OnHit, nullptr, nullptr, nullptr);
 			init = true;
 		}
@@ -276,8 +388,6 @@ bool OBSEPlugin_Query(const OBSEInterface* obse, PluginInfo* info)
 
 	return true;
 }
-
-
 
 bool OBSEPlugin_Load(const OBSEInterface* obse)
 {
